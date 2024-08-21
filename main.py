@@ -4,7 +4,6 @@ import logging
 import os
 import random
 import re
-import subprocess
 import sys
 import traceback
 
@@ -18,12 +17,7 @@ init(autoreset=True)
 logging.basicConfig(level=logging.INFO)
 
 
-async def read_tokens(file_path):
-    async with aiofiles.open(file_path, mode='r') as file:
-        return [line.strip() async for line in file]
-
-
-async def read_group_links(file_path):
+async def read_lines(file_path):
     async with aiofiles.open(file_path, mode='r') as file:
         return [line.strip() async for line in file]
 
@@ -41,16 +35,28 @@ async def read_proxies(file_path):
     return proxies
 
 
+def check_cache(cache_file, video_id):
+    if not os.path.exists(cache_file):
+        open(cache_file, 'w').close()
+    with open(cache_file, mode='r') as cache:
+        downloaded_ids = cache.read().splitlines()
+    if video_id in downloaded_ids:
+        print(
+            Fore.MAGENTA
+            + f'Клип закеширован и видимо уже был скачан: {video_id}'
+        )
+        return True
+    with open(cache_file, mode='a') as cache:
+        cache.write(video_id + '\n')
+
+
 async def validate_token(token):
     try:
         vk_session = vk_api.VkApi(token=token)
         vk = vk_session.get_api()
         vk.account.getInfo()
         return token
-    except ApiError as e:
-        print(Fore.RED + f'Ошибка API VK с токеном {token}: {e}')
-        return None
-    except Exception as e:
+    except (ApiError, Exception) as e:
         print(Fore.RED + f'Ошибка при проверке токена {token}: {e}')
         return None
 
@@ -75,7 +81,7 @@ async def get_group_id_and_name(vk, group_link):
     except Exception as e:
         print(
             Fore.RED
-            + f'Не удается получить ID и название группы: {group_link}. Ошибка: {e}'
+            + f'Ошибка при получении ID и названия группы: {group_link}. Ошибка: {e}'
         )
         raise ValueError(
             f'Ошибка при получении ID и названия группы: {group_link}'
@@ -83,13 +89,11 @@ async def get_group_id_and_name(vk, group_link):
 
 
 def sanitize_filename(filename):
-    invalid_chars = '<>:"/\\|?*'
-    return ''.join(c if c not in invalid_chars else '_' for c in filename)
+    return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
 
-async def download_video(video_url, save_dir, proxies):
+async def download_video(video_url, save_dir, proxies, cache_file):
     video_id = re.search(r'id=(\d+)', video_url).group(1)
-
     ydl_opts = {
         'quiet': True,
         'outtmpl': os.path.join(save_dir, f'%(title)s_{video_id}.mp4'),
@@ -99,62 +103,37 @@ async def download_video(video_url, save_dir, proxies):
     }
 
     if proxies:
-        proxy = random.choice(proxies)
-        ydl_opts['proxy'] = proxy
+        ydl_opts['proxy'] = random.choice(proxies)
 
     def download():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info_dict = ydl.extract_info(video_url, download=False)
-                title = info_dict.get('title', None)
-                output_file = f'{save_dir}/{title}_{video_id}.mp4'
-
-                if os.path.exists(output_file):
-                    print(Fore.GREEN + f'Видео уже скачано: {output_file}')
-                    return
-
-                ydl.download([video_url])
-                print(Fore.CYAN + f'Видео успешно скачано: {output_file}')
-                return output_file
-            except Exception as e:
-                print(
-                    Fore.RED + f'Ошибка скачивания:\n {traceback.format_exc()}'
-                )
+        try:
+            if check_cache(cache_file, video_id):
                 return
 
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(video_url, download=False)
+                title = info_dict.get('title', None)
+                output_file = os.path.join(save_dir, f'{title}_{video_id}.mp4')
+
+                if os.path.exists(output_file):
+                    print(Fore.GREEN + f'Клип уже скачан: {output_file}')
+                    return output_file
+
+                ydl.download([video_url])
+                print(Fore.CYAN + f'Клип успешно скачан: {output_file}')
+                return output_file
+
+        except Exception:
+            print(Fore.RED + f'Ошибка скачивания:\n {traceback.format_exc()}')
+            return None
+
     loop = asyncio.get_running_loop()
-    output_file = await loop.run_in_executor(None, download)
-
-    # Проверка целостности видео закомментирована
-    # try:
-    #     if not await check_video_integrity(output_file):
-    #         print(Fore.RED + f'Битое видео обнаружено: {output_file}')
-    #         try:
-    #             os.remove(output_file)
-    #             print(Fore.RED + f'Битое видео удалено: {output_file}')
-    #         except FileNotFoundError:
-    #             print(Fore.RED + f'Ошибка: файл для удаления не найден: {output_file}')
-    #         except Exception as e:
-    #             print(Fore.RED + f'Ошибка при удалении файла: {e}')
-    #     else:
-    #         print(Fore.GREEN + f'Видео успешно проверено: {output_file}')
-    # except Exception as e:
-    #     print(Fore.RED + f'\nОшибка при проверке целостности видео {output_file}: {e}')
+    return await loop.run_in_executor(None, download)
 
 
-async def get_clips(tokens, group_link, executor, proxies):
-    token = random.choice(await get_valid_tokens(tokens))
-    vk_session = vk_api.VkApi(token=token)
-    vk = vk_session.get_api()
-
-    group_id, group_title = await get_group_id_and_name(vk, group_link)
-    sanitized_group_title = sanitize_filename(group_title)
-    save_dir = os.path.join('clips', f'Группа_{sanitized_group_title}')
-    os.makedirs(save_dir, exist_ok=True)
-
+async def fetch_video_urls(vk, group_id, group_title, count=200):
     videos = []
     offset = 0
-    count = 200
 
     while True:
         sys.stdout.write(
@@ -167,11 +146,8 @@ async def get_clips(tokens, group_link, executor, proxies):
                 owner_id=group_id, album_id=-6, offset=offset, count=count
             )
             items = response['items']
-        except ApiError as e:
+        except (ApiError, Exception) as e:
             logging.error(Fore.RED + f'Ошибка API VK: {e}')
-            break
-        except Exception as e:
-            logging.error(Fore.RED + f'Произошла ошибка: {e}')
             break
 
         if not items:
@@ -184,16 +160,35 @@ async def get_clips(tokens, group_link, executor, proxies):
 
         offset += count
 
+    return videos
+
+
+async def get_clips(tokens, group_link, proxies):
+    token = random.choice(await get_valid_tokens(tokens))
+    vk_session = vk_api.VkApi(token=token)
+    vk = vk_session.get_api()
+
+    group_id, group_title = await get_group_id_and_name(vk, group_link)
+    sanitized_group_title = sanitize_filename(group_title)
+    save_dir = os.path.join('clips', f'Группа_{sanitized_group_title}')
+    os.makedirs(save_dir, exist_ok=True)
+
+    cache_file = os.path.join('cache', f'{sanitized_group_title}.txt')
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+
+    video_urls = await fetch_video_urls(vk, group_id, group_title)
     await asyncio.gather(
-        *(download_video(video, save_dir, proxies) for video in videos)
+        *(
+            download_video(video_url, save_dir, proxies, cache_file)
+            for video_url in video_urls
+        )
     )
 
 
 async def main():
-    tokens = await read_tokens('tokens.txt')
-    group_links = await read_group_links('groups.txt')
-    # proxies = await read_proxies('proxies.txt')
-    proxies = []
+    tokens = await read_lines('tokens.txt')
+    group_links = await read_lines('groups.txt')
+    proxies = []  # Or await read_proxies('proxies.txt')
 
     valid_tokens = await get_valid_tokens(tokens)
 
@@ -214,7 +209,7 @@ async def main():
             loop.run_in_executor(
                 executor,
                 lambda link: asyncio.run(
-                    get_clips(valid_tokens, link, executor, proxies)
+                    get_clips(valid_tokens, link, proxies)
                 ),
                 link,
             )
